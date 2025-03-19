@@ -263,6 +263,7 @@ impl<S: Sleeper> AsyncClient<S> {
         let url = format!("{}{}", self.url, path);
         let body = serialize::<T>(&body).to_lower_hex_string();
 
+        self.log_request(&url, "POST");
         let response = self.client.post(url).body(body).send().await?;
 
         if !response.status().is_success() {
@@ -466,6 +467,7 @@ impl<S: Sleeper> AsyncClient<S> {
         let mut attempts = 0;
 
         loop {
+            self.log_request(url, "GET");
             match self.client.get(url).send().await? {
                 resp if attempts < self.max_retries && is_status_retryable(resp.status()) => {
                     S::sleep(delay).await;
@@ -475,6 +477,40 @@ impl<S: Sleeper> AsyncClient<S> {
                 resp => return Ok(resp),
             }
         }
+    }
+
+    /// Lexe patch: Log every request, so we know
+    ///
+    /// 1) which endpoints we're calling,
+    /// 2) how many requests we're making, and
+    /// 3) which services these requests are sent to.
+    ///
+    /// TODO(max): Eventually this should be done with metrics, not logs.
+    fn log_request(&self, url: &str, method: &str) {
+        let base_url = &self.url;
+
+        // For user privacy, log only the part of the path up to the first `/`.
+        let path_prefix = path_prefix(&self.url, url);
+
+        // "Esplora request: GET https://blockstream.info/api/address"
+        // "Esplora request: POST https://mempool.space/api/tx"
+        debug!("Esplora request: {method} {base_url}/{path_prefix}");
+    }
+}
+
+/// `base_url`: "https://mempool.space/api"
+/// `url`: "/tx/foo"
+/// => `path_prefix`: "/tx"
+fn path_prefix<'a>(base_url: &str, url: &'a str) -> &'a str {
+    if url.len() <= base_url.len() + 1 {
+        return url;
+    }
+
+    let path = &url[base_url.len() + 1..];
+    if let Some(slash_idx) = path.find('/') {
+        &url[..base_url.len() + 1 + slash_idx]
+    } else {
+        url
     }
 }
 
@@ -496,5 +532,36 @@ impl Sleeper for DefaultSleeper {
 
     fn sleep(dur: std::time::Duration) -> Self::Sleep {
         tokio::time::sleep(dur)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// $ cargo test test_sanitize -- --show-output
+    #[test]
+    fn test_path_prefix() {
+        let base_url = "https://mempool.space/api";
+        let test_cases = [
+            ["https://mempool.space", "https://mempool.space"],
+            ["https://mempool.space/api/", "https://mempool.space/api/"],
+            [
+                "https://mempool.space/api/tx",
+                "https://mempool.space/api/tx",
+            ],
+            [
+                "https://mempool.space/api/tx/foo",
+                "https://mempool.space/api/tx",
+            ],
+        ];
+
+        for [url, expected] in test_cases {
+            let sanitized = path_prefix(base_url, url);
+            assert_eq!(sanitized, expected);
+            println!("Original URL: {url}");
+            println!("Sanitized: {sanitized}");
+            println!("---");
+        }
     }
 }
