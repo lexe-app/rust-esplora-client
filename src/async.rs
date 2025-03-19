@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::encode::serialize_hex;
@@ -264,13 +264,15 @@ impl<S: Sleeper> AsyncClient<S> {
         query_params: Option<HashSet<(&str, String)>>,
     ) -> Result<Response, Error> {
         let url: String = format!("{}{}", self.url, path);
-        let mut request = self.client.post(url).body(body);
+        let mut request = self.client.post(&url).body(body);
 
         for param in query_params.unwrap_or_default() {
             request = request.query(&param);
         }
 
+        let start = Instant::now();
         let response = request.send().await?;
+        self.log_response(&url, "POST", &response, start);
 
         if !response.status().is_success() {
             return Err(Error::HttpResponse {
@@ -627,15 +629,69 @@ impl<S: Sleeper> AsyncClient<S> {
         let mut attempts = 0;
 
         loop {
+            let start = Instant::now();
             match self.client.get(url).send().await? {
                 resp if attempts < self.max_retries && is_status_retryable(resp.status()) => {
+                    self.log_response(url, "GET", &resp, start);
                     S::sleep(delay).await;
                     attempts += 1;
                     delay *= 2;
                 }
-                resp => return Ok(resp),
+                resp => {
+                    self.log_response(url, "GET", &resp, start);
+                    return Ok(resp);
+                }
             }
         }
+    }
+
+    /// Lexe patch: Log every completed request, so we know:
+    ///
+    /// 1) which endpoints we're calling,
+    /// 2) how many requests we're making,
+    /// 3) which services these requests are sent to,
+    /// 4) how long each request takes, and
+    /// 5) how large the response is.
+    ///
+    /// TODO(max): Eventually this should be done with metrics, not logs.
+    fn log_response(&self, url: &str, method: &str, resp: &Response, start: Instant) {
+        // For user privacy, log only up to the first path segment after
+        // the base URL, stripping user-specific parameters.
+        let sanitized = sanitize_url(&self.url, url);
+        let status = resp.status().as_u16();
+        let duration_ms = start.elapsed().as_secs_f64() / 1000.0;
+        let size_kib = resp
+            .content_length()
+            .map(|len| len as f64 / 1024.0)
+            .unwrap_or(0.0);
+
+        // "GET https://blockstream.info/api/address => 200, 3ms, 1.2KiB"
+        debug!("{method} {sanitized} => {status}, {duration_ms:.3}ms, {size_kib:.3}KiB)");
+    }
+}
+
+/// Truncate a full request URL to just `base_url` + the first path segment,
+/// so we log which endpoint was called without leaking user-specific path
+/// parameters.
+///
+///
+/// ```text
+/// base_url  "https://mempool.space/api"
+///      url  "https://mempool.space/api/tx/abc123"
+///       =>  "https://mempool.space/api/tx"
+/// ```
+fn sanitize_url<'a>(base_url: &str, url: &'a str) -> &'a str {
+    // Find the start of the relative path after `base_url` + '/'.
+    let rel_start = base_url.len() + 1;
+    let relative = match url.get(rel_start..) {
+        Some(r) => r,
+        None => return url,
+    };
+
+    // Truncate at the next '/' to keep only the first segment.
+    match relative.find('/') {
+        Some(idx) => &url[..rel_start + idx],
+        None => url,
     }
 }
 
@@ -661,5 +717,35 @@ impl Sleeper for DefaultSleeper {
 
     fn sleep(dur: std::time::Duration) -> Self::Sleep {
         tokio::time::sleep(dur)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// $ cargo test -p esplora-client --lib -- test_sanitize_url
+    #[test]
+    fn test_sanitize_url() {
+        #[track_caller]
+        fn test(url: &str, expected: &str) {
+            let base_url = "https://mempool.space/api";
+            assert_eq!(sanitize_url(base_url, url), expected, "url: {url}");
+        }
+
+        test("https://mempool.space", "https://mempool.space");
+        test("https://mempool.space/api/", "https://mempool.space/api/");
+        test(
+            "https://mempool.space/api/tx",
+            "https://mempool.space/api/tx",
+        );
+        test(
+            "https://mempool.space/api/tx/abc123",
+            "https://mempool.space/api/tx",
+        );
+        test(
+            "https://mempool.space/api/scripthash/abc123",
+            "https://mempool.space/api/scripthash",
+        );
     }
 }
