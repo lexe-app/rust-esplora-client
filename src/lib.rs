@@ -63,6 +63,9 @@
 //! * `async-https-rustls-manual-roots` enables [`reqwest`], the async client with support for
 //!   proxying and TLS (SSL) using the `rustls` TLS backend without using its the default root
 //!   certificates.
+//!
+//! [`minreq`]: https://docs.rs/minreq
+//! [`reqwest`]: https://docs.rs/reqwest
 
 #![allow(clippy::result_large_err)]
 
@@ -168,7 +171,7 @@ impl Builder {
     }
 
     /// Set the maximum number of times to retry a request if the response status
-    /// is one of [`RETRYABLE_ERROR_CODES`].
+    /// is one of `RETRYABLE_ERROR_CODES`.
     pub fn max_retries(mut self, count: usize) -> Self {
         self.max_retries = count;
         self
