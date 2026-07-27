@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::encode::serialize_hex;
@@ -44,6 +44,7 @@ use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::{Address, Amount, Block, BlockHash, FeeRate, MerkleBlock, Script, Transaction, Txid};
 
 use bitreq::{Client, Method, Proxy, Request, RequestExt, Response};
+use log::debug;
 
 use crate::{
     duration_to_timeout_secs, is_retryable, is_success, sat_per_vbyte_to_feerate, AddressStats,
@@ -162,15 +163,42 @@ impl<S: Sleeper> AsyncClient<S> {
         let request = self.build_request(Method::Get, path)?;
 
         loop {
+            let start = Instant::now();
             match request.clone().send_async_with_client(&self.client).await? {
                 response if attempts < self.max_retries && is_retryable(&response) => {
+                    self.log_response(path, "GET", &response, start);
                     S::sleep(delay).await;
                     attempts += 1;
                     delay *= 2;
                 }
-                response => return Ok(response),
+                response => {
+                    self.log_response(path, "GET", &response, start);
+                    return Ok(response);
+                }
             }
         }
+    }
+
+    /// Lexe patch: Log every completed request, so we know:
+    ///
+    /// 1) which endpoints we're calling,
+    /// 2) how many requests we're making,
+    /// 3) which services these requests are sent to,
+    /// 4) how long each request takes, and
+    /// 5) how large the response is.
+    ///
+    /// TODO(max): Eventually this should be done with metrics, not logs.
+    fn log_response(&self, path: &str, method: &str, response: &Response, start: Instant) {
+        let base_url = &self.url;
+        // For user privacy, log only the first path segment, which identifies
+        // the endpoint without the user-specific parameters that follow.
+        let endpoint = first_path_segment(path);
+        let status = response.status_code;
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let size_kib = response.as_bytes().len() as f64 / 1024.0;
+
+        // "GET https://blockstream.info/api/address => 200, 3ms, 1.2KiB"
+        debug!("{method} {base_url}{endpoint} => {status}, {duration_ms:.3}ms, {size_kib:.3}KiB");
     }
 
     /// Makes a GET request to `path`, deserializing the response body as raw
@@ -327,7 +355,9 @@ impl<S: Sleeper> AsyncClient<S> {
             request = request.with_param(key, value);
         }
 
+        let start = Instant::now();
         let response = request.send_async_with_client(&self.client).await?;
+        self.log_response(path, "POST", &response, start);
 
         if !is_success(&response) {
             let status = u16::try_from(response.status_code).map_err(Error::StatusCode)?;
@@ -749,6 +779,21 @@ impl<S: Sleeper> AsyncClient<S> {
     }
 }
 
+/// Truncate a request path to its first segment, which identifies the endpoint
+/// without the user-specific parameters that follow.
+///
+/// ```text
+/// path  "/tx/abc123/raw"
+///   =>  "/tx"
+/// ```
+fn first_path_segment(path: &str) -> &str {
+    // Skip the leading '/', then truncate at the next one.
+    match path.get(1..).and_then(|rest| rest.find('/')) {
+        Some(idx) => &path[..idx + 1],
+        None => path,
+    }
+}
+
 /// A trait for abstracting over async sleep implementations.
 ///
 /// [`AsyncClient`] uses this trait to wait between retry attempts without
@@ -776,5 +821,26 @@ impl Sleeper for DefaultSleeper {
 
     fn sleep(dur: std::time::Duration) -> Self::Sleep {
         tokio::time::sleep(dur)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// $ cargo test -p esplora-client --lib -- test_first_path_segment
+    #[test]
+    fn test_first_path_segment() {
+        #[track_caller]
+        fn test(path: &str, expected: &str) {
+            assert_eq!(first_path_segment(path), expected, "path: {path}");
+        }
+
+        test("", "");
+        test("/", "/");
+        test("/tx", "/tx");
+        test("/tx/abc123", "/tx");
+        test("/tx/abc123/raw", "/tx");
+        test("/scripthash/abc123/txs", "/scripthash");
     }
 }
