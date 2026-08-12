@@ -25,6 +25,7 @@ serde_json = { version = "1.0.117", features = ["std"], default-features = false
 bitcoin = { version = "0.32", features = ["serde", "std"], default-features = false }
 hex = { version = "0.2.2", package = "hex-conservative" }
 bitreq = { version = "0.3.7", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false }
 # Default runtime when running async tests
 tokio = { version = "1", features = ["time"], optional = true }
 
@@ -44,11 +45,11 @@ security-framework = { version = "=2.11.1" } # blame: rustls-native-certs 0.8.3 
 default = ["blocking", "blocking-https", "async", "async-https", "tokio"]
 
 tokio = ["dep:tokio"]
-async = ["bitreq/async", "bitreq/proxy", "bitreq/json-using-serde", "tokio?/time"]
-async-https = ["async", "bitreq/async-https"]
-async-https-native = ["async", "bitreq/async-https-native-tls"]
-async-https-rustls = ["async", "bitreq/async-https-rustls"]
-async-https-rustls-probe = ["async", "bitreq/async-https-rustls-probe"]
+async = ["dep:reqwest", "tokio?/time"]
+async-https = ["async", "reqwest/default-tls"]
+async-https-native = ["async", "reqwest/native-tls"]
+async-https-rustls = ["async", "reqwest/rustls-tls"]
+async-https-rustls-probe = ["async", "reqwest/rustls-tls-native-roots"]
 
 blocking = ["bitreq/proxy", "bitreq/json-using-serde"]
 blocking-https = ["blocking", "bitreq/https"]
@@ -91,4 +92,6 @@ exact_features = [
     ["async-https-native", "blocking-https-native", "tokio"],
     ["async-https-rustls", "blocking-https-rustls", "tokio"],
     ["async-https-rustls-probe", "blocking-https-rustls-probe", "tokio"],
+    # `async` without `blocking` keeps `bitreq` out of the tree
+    ["async", "tokio"],
 ]

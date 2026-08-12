@@ -3,7 +3,7 @@
 //! # Asynchronous Esplora Client
 //!
 //! This module implements [`AsyncClient`], an asynchronous HTTP client for
-//! interacting with an [Esplora] server by way of [`bitreq`].
+//! interacting with an [Esplora] server by way of [`reqwest`].
 //!
 //! Use this client from async applications and libraries. Each method returns a
 //! future that sends the request, waits for the response, and decodes the body
@@ -43,18 +43,15 @@ use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::{Address, Amount, Block, BlockHash, FeeRate, MerkleBlock, Script, Transaction, Txid};
 
-use bitreq::{Client, Method, Proxy, Request, RequestExt};
-
 use crate::{
-    duration_to_timeout_secs, sat_per_vbyte_to_feerate, AddressStats, BlockInfo, BlockStatus,
-    Builder, Error, EsploraTx, HttpResponse, MempoolRecentTx, MempoolStats, MerkleProof,
-    OutputStatus, ScriptHashStats, SubmitPackageResult, TxStatus, Utxo, BASE_BACKOFF_MILLIS,
+    sat_per_vbyte_to_feerate, AddressStats, BlockInfo, BlockStatus, Builder, Error, EsploraTx,
+    HttpResponse, MempoolRecentTx, MempoolStats, MerkleProof, OutputStatus, ScriptHashStats,
+    SubmitPackageResult, TxStatus, Utxo, BASE_BACKOFF_MILLIS,
 };
 
 #[allow(deprecated)]
 use crate::BlockSummary;
 
-// FIXME: (@oleonardolima) there's no `Debug` implementation for `bitreq::Client`.
 /// An async client for interacting with an Esplora API server.
 ///
 /// Use [`Builder`] to construct an instance of this client. The client stores
@@ -75,18 +72,10 @@ use crate::BlockSummary;
 pub struct AsyncClient<S = DefaultSleeper> {
     /// The URL of the Esplora server.
     url: String,
-    /// The URL of the proxy host.
-    ///
-    /// NOTE: The proxy is ignored when targeting `wasm32`.
-    proxy: Option<String>,
-    /// Per-request socket timeout.
-    timeout: Option<Duration>,
-    /// HTTP headers to set on every request made to the Esplora server.
-    headers: HashMap<String, String>,
     /// Maximum number of retry attempts for retryable responses.
     max_retries: usize,
-    /// The inner [`bitreq::Client`] HTTP client to cache connections.
-    client: Client,
+    /// The inner HTTP [`reqwest::Client`] which caches connections.
+    client: reqwest::Client,
     /// Marker for the sleeper implementation.
     marker: PhantomData<S>,
 }
@@ -94,8 +83,8 @@ pub struct AsyncClient<S = DefaultSleeper> {
 impl<S: Sleeper> AsyncClient<S> {
     /// Build an [`AsyncClient`] from a [`Builder`].
     ///
-    /// Configures the underlying [`bitreq::Client`] with
-    /// proxy, timeout, and headers specified in the [`Builder`].
+    /// Configures the underlying [`reqwest::Client`] with the proxy, timeout,
+    /// headers, and connection limit specified in the [`Builder`].
     /// No network request is made until a client method is awaited.
     ///
     /// # Errors
@@ -103,15 +92,56 @@ impl<S: Sleeper> AsyncClient<S> {
     /// Returns an [`Error`] if the HTTP client fails to build,
     /// or if any of the provided header names or values are invalid.
     pub fn from_builder(builder: Builder) -> Result<Self, Error> {
+        let mut client_builder = reqwest::Client::builder();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(proxy) = &builder.proxy {
+            client_builder = client_builder.proxy(reqwest::Proxy::all(proxy)?);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(timeout) = builder.timeout {
+            client_builder = client_builder.timeout(timeout);
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            client_builder = client_builder.pool_max_idle_per_host(builder.max_connections);
+        }
+
+        if !builder.headers.is_empty() {
+            let mut headers = reqwest::header::HeaderMap::new();
+            for (k, v) in builder.headers {
+                let header_name =
+                    reqwest::header::HeaderName::from_lowercase(k.to_lowercase().as_bytes())
+                        .map_err(|_| Error::InvalidHttpHeaderName(k))?;
+                let header_value = reqwest::header::HeaderValue::from_str(&v)
+                    .map_err(|_| Error::InvalidHttpHeaderValue(v))?;
+                headers.insert(header_name, header_value);
+            }
+            client_builder = client_builder.default_headers(headers);
+        }
+
         Ok(AsyncClient {
             url: builder.base_url,
-            proxy: builder.proxy,
-            timeout: builder.timeout,
-            headers: builder.headers,
             max_retries: builder.max_retries,
-            client: Client::new(builder.max_connections),
+            client: client_builder.build()?,
             marker: PhantomData,
         })
+    }
+
+    /// Build an [`AsyncClient`] from a base `url` and an existing
+    /// [`reqwest::Client`].
+    ///
+    /// Lets callers inject a client with a custom configuration, e.g. a
+    /// specific TLS setup via `reqwest::ClientBuilder::use_preconfigured_tls`.
+    pub fn from_client(url: String, client: reqwest::Client) -> Self {
+        AsyncClient {
+            url,
+            max_retries: crate::DEFAULT_MAX_RETRIES,
+            client,
+            marker: PhantomData,
+        }
     }
 
     /// Return the base URL of the Esplora server this client connects to.
@@ -121,43 +151,19 @@ impl<S: Sleeper> AsyncClient<S> {
         &self.url
     }
 
-    /// Return the underlying [`bitreq::Client`].
+    /// Return the underlying HTTP [`reqwest::Client`].
     ///
     /// This can be useful for callers that need access to shared connection
     /// state managed by the HTTP client.
-    pub fn client(&self) -> &Client {
+    pub fn client(&self) -> &reqwest::Client {
         &self.client
-    }
-
-    /// Build a HTTP [`Request`] with given [`Method`] and URI `path`.
-    ///
-    /// Configures the request with the proxy, timeout, and headers set on
-    /// this client. Used internally by all other request helper methods.
-    pub(crate) fn build_request(&self, method: Method, path: &str) -> Result<Request, Error> {
-        let mut request = Request::new(method, format!("{}{}", self.url, path));
-
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(proxy) = &self.proxy {
-            request = request.with_proxy(Proxy::new_http(proxy)?);
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(timeout) = self.timeout {
-            request = request.with_timeout(duration_to_timeout_secs(timeout));
-        }
-
-        if !self.headers.is_empty() {
-            request = request.with_headers(&self.headers);
-        }
-
-        Ok(request)
     }
 
     /// Sends a single GET request to `path`.
     async fn send_get(&self, path: &str) -> Result<HttpResponse, Error> {
-        let request = self.build_request(Method::Get, path)?;
-        let response = request.send_async_with_client(&self.client).await?;
-        HttpResponse::from_bitreq(response)
+        let url = format!("{}{}", self.url, path);
+        let response = self.client.get(url).send().await?;
+        HttpResponse::from_reqwest(response).await
     }
 
     /// Sends a single POST request to `path` with `body` and query parameters.
@@ -167,14 +173,15 @@ impl<S: Sleeper> AsyncClient<S> {
         body: Vec<u8>,
         query_params: Option<HashSet<(&str, String)>>,
     ) -> Result<HttpResponse, Error> {
-        let mut request = self.build_request(Method::Post, path)?.with_body(body);
+        let url = format!("{}{}", self.url, path);
+        let mut request = self.client.post(url).body(body);
 
         for (key, value) in query_params.unwrap_or_default() {
-            request = request.with_param(key, value);
+            request = request.query(&[(key, value)]);
         }
 
-        let response = request.send_async_with_client(&self.client).await?;
-        HttpResponse::from_bitreq(response)
+        let response = request.send().await?;
+        HttpResponse::from_reqwest(response).await
     }
 
     /// Sends a GET request to `path`, retrying on retryable status codes

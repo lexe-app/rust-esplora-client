@@ -5,9 +5,10 @@
 //! A client library for querying [Esplora] HTTP APIs from Rust.
 //!
 //! The crate exposes a shared set of Esplora response types in [`api`], plus
-//! optional blocking and async clients built on [`bitreq`]. Both clients use the
-//! same [`Builder`] configuration for the base URL, proxy, timeout, custom
-//! headers, and retry policy.
+//! an optional blocking client built on [`bitreq`] and an optional async
+//! client built on [`reqwest`]. Both clients use the same [`Builder`]
+//! configuration for the base URL, proxy, timeout, custom headers, and retry
+//! policy.
 //!
 //! # Client Modes
 //!
@@ -73,19 +74,20 @@
 //!   capabilities using the platform's native TLS backend (likely OpenSSL).
 //! * `blocking-https-rustls-probe` enables [`bitreq`], the blocking client with proxy and TLS (SSL)
 //!   capabilities using `rustls` and probed system roots.
-//! * `async` enables [`bitreq`], the async client with proxy capabilities.
-//! * `async-https` enables [`bitreq`], the async client with support for proxying and TLS (SSL)
-//!   using the default [`bitreq`] TLS backend.
-//! * `async-https-native` enables [`bitreq`], the async client with support for proxying and TLS
+//! * `async` enables [`reqwest`], the async client with proxy capabilities.
+//! * `async-https` enables [`reqwest`], the async client with support for proxying and TLS (SSL)
+//!   using the default [`reqwest`] TLS backend (`native-tls`).
+//! * `async-https-native` enables [`reqwest`], the async client with support for proxying and TLS
 //!   (SSL) using the platform's native TLS backend (likely OpenSSL).
-//! * `async-https-rustls` enables [`bitreq`], the async client with support for proxying and TLS
-//!   (SSL) using the `rustls` TLS backend.
-//! * `async-https-rustls-probe` enables [`bitreq`], the async client with support for proxying and
-//!   TLS (SSL) using `rustls` and probed system roots.
+//! * `async-https-rustls` enables [`reqwest`], the async client with support for proxying and TLS
+//!   (SSL) using the `rustls` TLS backend with WebPKI roots.
+//! * `async-https-rustls-probe` enables [`reqwest`], the async client with support for proxying
+//!   and TLS (SSL) using `rustls` and probed system roots.
 //! * `tokio` enables the default async sleeper used by [`Builder::build_async`].
 //!
 //! [Esplora]: https://github.com/Blockstream/esplora/blob/master/API.md
 //! [`bitreq`]: https://docs.rs/bitreq
+//! [`reqwest`]: https://docs.rs/reqwest
 #![allow(clippy::result_large_err)]
 #![warn(missing_docs)]
 #![allow(deprecated)]
@@ -105,7 +107,7 @@ pub mod r#async;
 pub mod blocking;
 
 pub use api::*;
-#[cfg(any(feature = "blocking", feature = "async"))]
+#[cfg(feature = "blocking")]
 use bitreq::Response;
 #[cfg(feature = "blocking")]
 pub use blocking::BlockingClient;
@@ -131,7 +133,7 @@ const DEFAULT_MAX_RETRIES: usize = 6;
 const DEFAULT_MAX_CONNECTIONS: usize = 10;
 
 /// Convert a [`Duration`] to whole timeout seconds for `bitreq`.
-#[cfg(any(feature = "blocking", feature = "async"))]
+#[cfg(feature = "blocking")]
 fn duration_to_timeout_secs(duration: Duration) -> u64 {
     if duration.subsec_nanos() == 0 {
         duration.as_secs()
@@ -194,8 +196,9 @@ pub struct Builder {
     /// `<protocol>://<user>:<password>@host:<port>`.
     ///
     /// Note that the format of this value and the supported protocols change
-    /// slightly by target and enabled transport features. See [bitreq]'s
-    /// proxy documentation for the accepted schemes.
+    /// slightly by target and enabled transport features. See the HTTP
+    /// client's proxy documentation for the accepted schemes ([bitreq] for
+    /// the blocking client, [`reqwest`] for the async client).
     ///
     /// The proxy is ignored when targeting `wasm32`.
     pub proxy: Option<String>,
@@ -205,7 +208,8 @@ pub struct Builder {
     pub headers: HashMap<String, String>,
     /// Maximum number of retry attempts for retryable HTTP responses.
     pub max_retries: usize,
-    /// Maximum number of cached connections for the async client.
+    /// Maximum number of idle pooled connections per host for the async
+    /// client.
     #[cfg(feature = "async")]
     pub max_connections: usize,
 }
@@ -299,8 +303,11 @@ impl Builder {
 #[derive(Debug)]
 pub enum Error {
     /// Error during a [`bitreq`] HTTP request.
-    #[cfg(any(feature = "blocking", feature = "async"))]
+    #[cfg(feature = "blocking")]
     BitReq(bitreq::Error),
+    /// Error during a [`reqwest`] HTTP request.
+    #[cfg(feature = "async")]
+    Reqwest(reqwest::Error),
     /// Error during JSON serialization or deserialization.
     SerdeJson(serde_json::Error),
     /// Non-successful HTTP response from the Esplora server.
@@ -340,8 +347,10 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(any(feature = "blocking", feature = "async"))]
+            #[cfg(feature = "blocking")]
             Error::BitReq(e) => write!(f, "Bitreq HTTP error: {e}"),
+            #[cfg(feature = "async")]
+            Error::Reqwest(e) => write!(f, "Reqwest HTTP error: {e}"),
             Error::SerdeJson(e) => write!(f, "JSON (de)serialization error: {e}"),
             Error::HttpResponse { status, message } => {
                 write!(f, "HTTP error {status}: {message}")
@@ -388,8 +397,10 @@ macro_rules! impl_error {
     };
 }
 
-#[cfg(any(feature = "blocking", feature = "async"))]
+#[cfg(feature = "blocking")]
 impl_error!(::bitreq::Error, BitReq, Error);
+#[cfg(feature = "async")]
+impl_error!(::reqwest::Error, Reqwest, Error);
 impl_error!(serde_json::Error, SerdeJson, Error);
 impl_error!(std::num::ParseIntError, Parsing, Error);
 impl_error!(bitcoin::consensus::encode::Error, BitcoinEncoding, Error);
@@ -409,9 +420,18 @@ struct HttpResponse {
 #[cfg(any(feature = "blocking", feature = "async"))]
 impl HttpResponse {
     /// Converts a [`bitreq::Response`], whose body is already fully read.
+    #[cfg(feature = "blocking")]
     fn from_bitreq(response: Response) -> Result<Self, Error> {
         let status = u16::try_from(response.status_code).map_err(Error::StatusCode)?;
         let body = response.into_bytes();
+        Ok(Self { status, body })
+    }
+
+    /// Converts a [`reqwest::Response`], reading the body to completion.
+    #[cfg(feature = "async")]
+    async fn from_reqwest(response: reqwest::Response) -> Result<Self, Error> {
+        let status = response.status().as_u16();
+        let body = Vec::from(response.bytes().await?);
         Ok(Self { status, body })
     }
 
