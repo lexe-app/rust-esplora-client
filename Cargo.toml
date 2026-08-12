@@ -26,6 +26,7 @@ bitcoin = { version = "0.32", features = ["serde", "std"], default-features = fa
 hex = { version = "0.2.2", package = "hex-conservative" }
 bitreq = { version = "0.3.7", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false }
+tracing = { version = "0.1" }
 # Default runtime when running async tests
 tokio = { version = "1", features = ["time"], optional = true }
 

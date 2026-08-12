@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bitcoin::block::Header as BlockHeader;
 use bitcoin::consensus::encode::serialize_hex;
@@ -42,6 +42,8 @@ use bitcoin::consensus::{deserialize, serialize, Decodable};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::{DisplayHex, FromHex};
 use bitcoin::{Address, Amount, Block, BlockHash, FeeRate, MerkleBlock, Script, Transaction, Txid};
+
+use tracing::debug;
 
 use crate::{
     sat_per_vbyte_to_feerate, AddressStats, BlockInfo, BlockStatus, Builder, Error, EsploraTx,
@@ -193,7 +195,10 @@ impl<S: Sleeper> AsyncClient<S> {
         let mut attempts = 0;
 
         loop {
-            let response = self.send_get(path).await?;
+            let start = Instant::now();
+            let result = self.send_get(path).await;
+            self.log_result(path, "GET", &result, start);
+            let response = result?;
 
             if attempts < self.max_retries && response.is_retryable() {
                 S::sleep(delay).await;
@@ -202,6 +207,50 @@ impl<S: Sleeper> AsyncClient<S> {
             } else {
                 return response.error_for_status();
             }
+        }
+    }
+
+    /// Lexe patch: Log every request, including failures, so we know:
+    ///
+    /// 1) which endpoints we're calling,
+    /// 2) how many requests we're making,
+    /// 3) which services these requests are sent to,
+    /// 4) how long each request takes,
+    /// 5) how large the response is, and
+    /// 6) how long failed requests took to fail.
+    ///
+    /// TODO(max): Eventually this should be done with metrics, not logs.
+    fn log_result(
+        &self,
+        path: &str,
+        method: &str,
+        result: &Result<HttpResponse, Error>,
+        start: Instant,
+    ) {
+        let base_url = &self.url;
+        // For user privacy, log only the first path segment, which identifies
+        // the endpoint without the user-specific parameters that follow.
+        let endpoint = first_path_segment(path);
+        let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        match result {
+            // "GET https://blockstream.info/api/address
+            //  => 200, HTTP/2.0, 3ms, 1.2KiB"
+            Ok(response) => {
+                let status = response.status;
+                let version = response.version;
+                let size_kib = response.body.len() as f64 / 1024.0;
+                debug!(
+                    "{method} {base_url}{endpoint} \
+                     => {status}, {version}, {duration_ms:.3}ms, {size_kib:.3}KiB"
+                );
+            }
+            // "GET https://blockstream.info/api/address
+            //  => error, 30000.000ms: error sending request"
+            Err(error) => debug!(
+                "{method} {base_url}{endpoint} \
+                 => error, {duration_ms:.3}ms: {error}"
+            ),
         }
     }
 
@@ -325,8 +374,10 @@ impl<S: Sleeper> AsyncClient<S> {
         body: T,
         query_params: Option<HashSet<(&str, String)>>,
     ) -> Result<HttpResponse, Error> {
-        let response = self.send_post(path, body.into(), query_params).await?;
-        response.error_for_status()
+        let start = Instant::now();
+        let result = self.send_post(path, body.into(), query_params).await;
+        self.log_result(path, "POST", &result, start);
+        result?.error_for_status()
     }
 
     /// Get a raw [`Transaction`] given its [`Txid`].
@@ -740,6 +791,21 @@ impl<S: Sleeper> AsyncClient<S> {
     }
 }
 
+/// Truncate a request path to its first segment, which identifies the endpoint
+/// without the user-specific parameters that follow.
+///
+/// ```text
+/// path  "/tx/abc123/raw"
+///   =>  "/tx"
+/// ```
+fn first_path_segment(path: &str) -> &str {
+    // Skip the leading '/', then truncate at the next one.
+    match path.get(1..).and_then(|rest| rest.find('/')) {
+        Some(idx) => &path[..idx + 1],
+        None => path,
+    }
+}
+
 /// A trait for abstracting over async sleep implementations.
 ///
 /// [`AsyncClient`] uses this trait to wait between retry attempts without
@@ -767,5 +833,26 @@ impl Sleeper for DefaultSleeper {
 
     fn sleep(dur: std::time::Duration) -> Self::Sleep {
         tokio::time::sleep(dur)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// $ cargo test -p esplora-client --lib -- test_first_path_segment
+    #[test]
+    fn test_first_path_segment() {
+        #[track_caller]
+        fn test(path: &str, expected: &str) {
+            assert_eq!(first_path_segment(path), expected, "path: {path}");
+        }
+
+        test("", "");
+        test("/", "/");
+        test("/tx", "/tx");
+        test("/tx/abc123", "/tx");
+        test("/tx/abc123/raw", "/tx");
+        test("/scripthash/abc123/txs", "/scripthash");
     }
 }

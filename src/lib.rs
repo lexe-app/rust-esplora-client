@@ -414,6 +414,11 @@ impl_error!(bitcoin::hex::HexToBytesError, HexToBytes, Error);
 #[cfg(any(feature = "blocking", feature = "async"))]
 struct HttpResponse {
     status: u16,
+    /// The negotiated HTTP version, e.g. "HTTP/1.1" or "HTTP/2.0".
+    ///
+    /// Only read by the async client's request logging.
+    #[cfg(feature = "async")]
+    version: &'static str,
     body: Vec<u8>,
 }
 
@@ -424,15 +429,32 @@ impl HttpResponse {
     fn from_bitreq(response: Response) -> Result<Self, Error> {
         let status = u16::try_from(response.status_code).map_err(Error::StatusCode)?;
         let body = response.into_bytes();
-        Ok(Self { status, body })
+        Ok(Self {
+            status,
+            // bitreq only speaks HTTP/1.1.
+            #[cfg(feature = "async")]
+            version: "HTTP/1.1",
+            body,
+        })
     }
 
     /// Converts a [`reqwest::Response`], reading the body to completion.
     #[cfg(feature = "async")]
     async fn from_reqwest(response: reqwest::Response) -> Result<Self, Error> {
         let status = response.status().as_u16();
+        let version = match response.version() {
+            reqwest::Version::HTTP_11 => "HTTP/1.1",
+            reqwest::Version::HTTP_2 => "HTTP/2.0",
+            reqwest::Version::HTTP_10 => "HTTP/1.0",
+            reqwest::Version::HTTP_3 => "HTTP/3.0",
+            _ => "HTTP/?",
+        };
         let body = Vec::from(response.bytes().await?);
-        Ok(Self { status, body })
+        Ok(Self {
+            status,
+            version,
+            body,
+        })
     }
 
     /// Whether the status code is successful (200-299).
