@@ -145,6 +145,13 @@ impl<S: Sleeper> AsyncClient<S> {
         }
     }
 
+    /// Sets `max_retries`, which [`from_client`](Self::from_client) otherwise
+    /// leaves at the default.
+    pub fn with_max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = max_retries;
+        self
+    }
+
     /// Return the base URL of the Esplora server this client connects to.
     ///
     /// The returned value is the exact string provided to [`Builder::new`].
