@@ -66,10 +66,10 @@ use crate::BlockSummary;
 ///
 /// # Retries
 ///
-/// Failed requests are automatically retried up to `max_retries` times
-/// (configured via [`Builder`]) with exponential backoff, but only for
-/// retryable HTTP status codes. See [`crate::RETRYABLE_ERROR_CODES`] for the
-/// full list.
+/// GET requests are retried up to `max_retries` times (configured via
+/// [`Builder`]) with exponential backoff, on retryable HTTP status codes (see
+/// [`crate::RETRYABLE_ERROR_CODES`]) and on transport errors. POST requests
+/// are never retried.
 #[derive(Clone)]
 pub struct AsyncClient<S = DefaultSleeper> {
     /// The URL of the Esplora server.
@@ -186,8 +186,9 @@ impl<S: Sleeper> AsyncClient<S> {
         HttpResponse::from_reqwest(response).await
     }
 
-    /// Sends a GET request to `path`, retrying on retryable status codes
-    /// with exponential backoff until [`AsyncClient::max_retries`] is reached.
+    /// Sends a GET request to `path`, retrying on retryable status codes and
+    /// transport errors with exponential backoff until
+    /// [`AsyncClient::max_retries`] is reached.
     ///
     /// Returns an [`Error::HttpResponse`] on a non-success status code.
     async fn get_with_retry(&self, path: &str) -> Result<HttpResponse, Error> {
@@ -198,14 +199,18 @@ impl<S: Sleeper> AsyncClient<S> {
             let start = Instant::now();
             let result = self.send_get(path).await;
             self.log_result(path, "GET", &result, start);
-            let response = result?;
 
-            if attempts < self.max_retries && response.is_retryable() {
+            let retryable = match &result {
+                Ok(response) => response.is_retryable(),
+                Err(Error::Reqwest(_)) => true,
+                Err(_) => false,
+            };
+            if retryable && attempts < self.max_retries {
                 S::sleep(delay).await;
                 attempts += 1;
                 delay *= 2;
             } else {
-                return response.error_for_status();
+                return result?.error_for_status();
             }
         }
     }
