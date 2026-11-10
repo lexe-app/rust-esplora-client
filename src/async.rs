@@ -67,9 +67,8 @@ use crate::BlockSummary;
 /// # Retries
 ///
 /// GET requests are retried up to `max_retries` times (configured via
-/// [`Builder`]) with exponential backoff, on retryable HTTP status codes (see
-/// [`crate::RETRYABLE_ERROR_CODES`]) and on transport errors. POST requests
-/// are never retried.
+/// [`Builder`]) with exponential backoff, on 429 or 5xx responses and on
+/// transport errors. POST requests are never retried.
 #[derive(Clone)]
 pub struct AsyncClient<S = DefaultSleeper> {
     /// The URL of the Esplora server.
@@ -186,7 +185,7 @@ impl<S: Sleeper> AsyncClient<S> {
         HttpResponse::from_reqwest(response).await
     }
 
-    /// Sends a GET request to `path`, retrying on retryable status codes and
+    /// Sends a GET request to `path`, retrying on 429 or 5xx responses and
     /// transport errors with exponential backoff until
     /// [`AsyncClient::max_retries`] is reached.
     ///

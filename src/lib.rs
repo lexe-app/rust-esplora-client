@@ -51,9 +51,10 @@
 //!
 //! # Retries
 //!
-//! Both clients retry responses with status codes listed in
-//! [`RETRYABLE_ERROR_CODES`]. Retry attempts use exponential backoff starting
-//! at 256 milliseconds and are controlled by [`Builder::max_retries`].
+//! Both clients retry responses with a 429 or 5xx status code, and the async
+//! client also retries GETs that fail with a transport error. Retry attempts
+//! use exponential backoff starting at 256 milliseconds and are controlled by
+//! [`Builder::max_retries`].
 //!
 //! # Features
 //!
@@ -113,13 +114,6 @@ use bitreq::Response;
 pub use blocking::BlockingClient;
 #[cfg(feature = "async")]
 pub use r#async::AsyncClient;
-
-/// HTTP response status codes for which a request may be retried.
-pub const RETRYABLE_ERROR_CODES: [u16; 3] = [
-    429, // TOO_MANY_REQUESTS
-    500, // INTERNAL_SERVER_ERROR
-    503, // SERVICE_UNAVAILABLE
-];
 
 /// Base delay used by the exponential retry backoff.
 #[cfg(any(feature = "blocking", feature = "async"))]
@@ -252,9 +246,6 @@ impl Builder {
     }
 
     /// Set the maximum number of retry attempts for retryable responses.
-    ///
-    /// Only responses whose status code is listed in
-    /// [`RETRYABLE_ERROR_CODES`] are retried.
     pub fn max_retries(mut self, count: usize) -> Self {
         self.max_retries = count;
         self
@@ -462,9 +453,9 @@ impl HttpResponse {
         (200..300).contains(&self.status)
     }
 
-    /// Whether the status code is retryable (see [`RETRYABLE_ERROR_CODES`]).
+    /// Whether the status code is retryable: 429, or any 5xx.
     fn is_retryable(&self) -> bool {
-        RETRYABLE_ERROR_CODES.contains(&self.status)
+        self.status == 429 || (500..600).contains(&self.status)
     }
 
     /// Returns an [`Error::HttpResponse`] on a non-success status code.

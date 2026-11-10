@@ -62,10 +62,8 @@ use crate::BlockSummary;
 ///
 /// # Retries
 ///
-/// Failed requests are automatically retried up to `max_retries` times
-/// (configured via [`Builder`]) with exponential backoff, but only for
-/// retryable HTTP status codes. See [`crate::RETRYABLE_ERROR_CODES`] for the
-/// full list.
+/// Requests are retried up to `max_retries` times (configured via
+/// [`Builder`]) with exponential backoff, on 429 or 5xx responses.
 #[derive(Debug, Clone)]
 pub struct BlockingClient {
     /// The URL of the Esplora server.
